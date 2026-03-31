@@ -20,19 +20,14 @@ class XEntropyAuxCriterionConfig(FairseqDataclass):
         default=0.0,
         metadata={"help": "the factor to control the balance loss"},
     )
-    distill_factor: float = field(
-        default=0.0,
-        metadata={"help": "the factor to control the distill loss"},
-    )
 
 
 @register_criterion("xentropy_aux", dataclass=XEntropyAuxCriterionConfig)
 class XEntropyAuxCriterion(FairseqCriterion):
-    def __init__(self, task, sentence_avg, balance_factor, distill_factor):
+    def __init__(self, task, sentence_avg, balance_factor):
         super().__init__(task)
         self.sentence_avg = sentence_avg
         self.balance_factor = balance_factor
-        self.distill_factor = distill_factor
 
     def forward(self, model, sample, reduce=True):
         """Compute the loss for the given sample.
@@ -44,16 +39,14 @@ class XEntropyAuxCriterion(FairseqCriterion):
         """
         net_output = model(**sample["net_input"])
         balance_loss = net_output[1]['balance_loss'] if net_output[1]['balance_loss'] else 0
-        distill_loss = net_output[1]['distill_loss'] if net_output[1]['distill_loss'] else 0
         lm_loss, _ = self.compute_loss(model, net_output, sample, reduce=reduce)
-        loss = lm_loss + self.balance_factor * balance_loss + self.distill_factor * distill_loss
+        loss = lm_loss + self.balance_factor * balance_loss
         sample_size = (
             sample["target"].size(0) if self.sentence_avg else sample["ntokens"]
         )
         # backward all losses, but only report lm_loss
         logging_output = {
             "loss": lm_loss.data,
-            "distill_loss": float(self.distill_factor * distill_loss),
             "balance_loss": float(self.balance_factor * balance_loss),
             "ntokens": sample["ntokens"],
             "nsentences": sample["target"].size(0),
@@ -77,7 +70,6 @@ class XEntropyAuxCriterion(FairseqCriterion):
     def reduce_metrics(logging_outputs) -> None:
         """Aggregate logging outputs from data parallel training."""
         loss_sum = sum(log.get("loss", 0) for log in logging_outputs)
-        distill_loss_sum = sum(log.get("distill_loss", 0) for log in logging_outputs)
         balance_loss_sum = sum(log.get("balance_loss", 0) for log in logging_outputs)
         ntokens = sum(log.get("ntokens", 0) for log in logging_outputs)
         sample_size = sum(log.get("sample_size", 0) for log in logging_outputs)
@@ -85,9 +77,6 @@ class XEntropyAuxCriterion(FairseqCriterion):
         # we divide by log(2) to convert the loss from base e to base 2
         metrics.log_scalar(
             "loss", loss_sum / sample_size / math.log(2), sample_size, round=3
-        )
-        metrics.log_scalar(
-            "distill_loss", distill_loss_sum / sample_size / math.log(2), sample_size, round=3
         )
         metrics.log_scalar(
             "balance_loss", balance_loss_sum / sample_size / math.log(2), sample_size, round=3
