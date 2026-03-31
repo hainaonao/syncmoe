@@ -27,9 +27,6 @@ python -m torch.distributed.launch \
     --arch transformer_lm_BaseGPT_x1_small \
     --moe-type base_layer \
     --two-stage-updates 6000 \
-    --distill-assignment \
-    --distilled-model wordemb \
-    --distill-factor 0.3 \
     --criterion xentropy_aux \
     --balance-loss balance \
     --balance-factor 0.3 \
