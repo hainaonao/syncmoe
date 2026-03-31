@@ -50,36 +50,6 @@ class BaseLayer(nn.Module):
         self.args = args
         self.num_workers = distributed_utils.get_data_parallel_world_size()
         routing_dim = args.decoder_embed_dim
-        distill_routing_dim = 50
-
-        if args.distill_assignment:
-            if args.distilled_model == 'wordemb':
-                self.routing_emb = nn.Embedding(args.vocab_size, distill_routing_dim, padding_idx=args.dict_pad_idx)
-            elif args.distilled_model == 'bigram_emb':
-                self.routing_emb = nn.Embedding(args.vocab_size, distill_routing_dim, padding_idx=args.dict_pad_idx)
-            elif args.distilled_model == 'cnn':
-                self.routing_emb = nn.Embedding(args.vocab_size, distill_routing_dim, padding_idx=args.dict_pad_idx)
-                routing_kernel = torch.rand(5) / 0.5 * 0.447 - 0.447
-                self.register_parameter("routing_kernel", torch.nn.Parameter(routing_kernel))
-            elif 'trm' in args.distilled_model:
-                num_layers = int(re.findall(r'trm(\d+)l', args.distilled_model)[0])
-                config = GPTNeoConfig.from_pretrained(args.hf_plm_dir)
-                config.vocab_size = args.vocab_size
-                config.attention_types = [[["global"], num_layers]]
-                config.bos_token_id = args.dict_bos_idx
-                config.eos_token_id = args.dict_eos_idx
-                config.num_layers = num_layers
-                config.max_position_embeddings = 1024
-                config.num_heads = 12
-                config.activation_function = 'relu'
-                distill_routing_dim = config.hidden_size
-                self.routing_model = GPTNeoModel(config)
-            else:
-                raise Exception('Now only support wordemb, bigram_emb, cnn, trmxl.')
-            distill_expert_centroids = torch.empty(self.num_workers, distill_routing_dim)
-            torch.nn.init.orthogonal_(distill_expert_centroids, gain=0.1)
-            self.register_parameter("distill_expert_centroids", torch.nn.Parameter(distill_expert_centroids))
-
         expert_centroids = torch.empty(self.num_workers, routing_dim)
         torch.nn.init.orthogonal_(expert_centroids, gain=0.1)
         self.register_parameter("expert_centroids", torch.nn.Parameter(expert_centroids))
@@ -114,36 +84,7 @@ class BaseLayer(nn.Module):
     def is_stage2(self):
         return self.num_updates >= self.args.two_stage_updates
 
-    def routing_wrapper(self, routing_ids):
-        if self.args.distilled_model == 'wordemb':
-            return self.routing_emb(routing_ids)
-        elif self.args.distilled_model == 'cnn':
-            emb = self.routing_emb(routing_ids)  # len, batch, hidden
-            seq_len = emb.shape[0]
-            padding_emb = torch.cat((torch.zeros([4] + list(emb.shape[1:]), device=emb.device, dtype=emb.dtype), emb), dim=0)  # len + 4, batch, hidden
-            stack_emb = torch.stack((padding_emb[4:4 + seq_len, :, :],
-                                    padding_emb[3:3 + seq_len, :, :],
-                                    padding_emb[2:2 + seq_len, :, :],
-                                    padding_emb[1:1 + seq_len, :, :],
-                                    padding_emb[0:0 + seq_len, :, :]
-                                    ), dim=3)  # len, batch, hidden, 5
-            cnn_emb = stack_emb.matmul(self.routing_kernel)
-            return cnn_emb
-        elif self.args.distilled_model == 'bigram_emb':
-            emb = self.routing_emb(routing_ids)  # len, batch, hidden
-            pre_emb = torch.cat((emb[0:1, :, :], emb[:-1, :, :]), dim=0)
-            bigram_emb = (emb + pre_emb) / 2.0
-            return bigram_emb
-        elif 'trm' in self.args.distilled_model:
-            return self.routing_model(routing_ids.transpose(0, 1))[0].transpose(0, 1)
-
     def forward(self, input_features, *args, **kwargs):
-        assert kwargs['input_ids'].shape == input_features.shape[:-1]  # len, batch, hidden
-
-        if self.args.distill_assignment:
-            routing_ids = kwargs['input_ids']
-            routing_features = self.routing_wrapper(routing_ids)
-            routing_features = routing_features.reshape(-1, routing_features.size(-1))
         features = input_features.reshape(-1, input_features.size(-1))
         tpe = features.shape[0]
         is_training = input_features.requires_grad
@@ -152,31 +93,18 @@ class BaseLayer(nn.Module):
             # Send each token to a random worker, to break correlations within the batch
             shuffle_sort = torch.randperm(features.size(0), device=features.device)
             features = All2AllDDM.apply(features[shuffle_sort])
-            if self.args.distill_assignment:
-                routing_features = All2AllDDM.apply(routing_features[shuffle_sort])
 
         with torch.no_grad():
-            # Compute similarity of each token to each expert for routing, and make the affinities finite
-            if self.args.distill_assignment and (self.is_stage2() or not is_training):
-                token_expert_affinities = routing_features.matmul(self.distill_expert_centroids.transpose(0, 1))
-            else:
-                token_expert_affinities = features.matmul(self.expert_centroids.transpose(0, 1))
+            # Tính toán độ tương đồng (affinity) trực tiếp từ đặc trưng sâu (features)
+            token_expert_affinities = features.matmul(self.expert_centroids.transpose(0, 1))
             token_expert_affinities = self.make_finite(token_expert_affinities)
-
-        # calculate distill loss
-        if self.args.distill_assignment and not self.is_stage2() and is_training:
-            distill_token_expert_affinities = routing_features.matmul(self.distill_expert_centroids.transpose(0, 1))  # len, ne
-            distill_target = token_expert_affinities.max(dim=1).indices  # len
-            distill_loss = F.cross_entropy(distill_token_expert_affinities, distill_target, reduction='sum')
-        else:
-            distill_loss = 0
 
         # Compute which token goes to which expert
         if self.is_stage2():
             sort_by_expert, input_splits, output_splits = self.greedy_assignment(token_expert_affinities)
         else:
             sort_by_expert, input_splits, output_splits = self.assignment_algorithm(token_expert_affinities) if is_training \
-                                                    else self.greedy_assignment(token_expert_affinities)
+                                                          else self.greedy_assignment(token_expert_affinities)
 
         # Swap these tokens for the right ones for our expert
         routed_features = All2AllDDM.apply(features[sort_by_expert], output_splits, input_splits)
@@ -205,9 +133,7 @@ class BaseLayer(nn.Module):
             # Undo shuffling
             result = All2AllDDM.apply(result)[self.inverse_sort(shuffle_sort)]
 
-        # Return additional Nones for compatibility with TransformerDecoderLayer
-        return result.view(input_features.size()), None, None, balance_loss, distill_loss
-
+        return result.view(input_features.size()), None, None, balance_loss
     def set_num_updates(self, num_updates):
         self.num_updates = num_updates
 
